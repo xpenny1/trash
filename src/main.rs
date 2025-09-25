@@ -3,12 +3,12 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{
     ForkResult, Pid, chdir, execvp, fork, getcwd, getpid, setpgid, tcsetpgrp, write,
 };
-use regex::Regex;
 use std::env;
 use std::ffi::CString;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::exit;
+use std::ops;
 
 enum Command {
     Builtin(BuiltinCommand),
@@ -43,164 +43,108 @@ enum Token {
     Whitespace,
 }
 
-struct Parser {
-    variable_regex: Regex,
+
+type ParseResult<'a, Output> = Option<(Output, &'a str)>;
+
+trait Parser<'a, Output> {
+    fn parse(&self, input: &'a str) -> ParseResult<'a, Output>;
+    fn many(&self) -> impl Parser<'a, Vec<Output>> {
+        move |input: &'a str| -> ParseResult<'a,Vec<Output>> {
+            let mut remaining: &'a str = "";
+            let mut parsed: Vec<Output> = Vec::new();
+            loop {
+                if let Some((p,r)) = self.parse(input) {
+                    parsed.push(p);
+                    remaining = r;
+                } else {
+                    return Option::Some((parsed, remaining))
+                }
+            }
+        }
+    }
+    fn or<P> (&self, parser: P) -> impl Parser<'a, Output>
+        where
+            P: Parser<'a, Output>
+    {
+        move |input| {
+            if let Option::Some(result) = self.parse(input) {
+                Option::Some(result)
+            } else {
+                parser.parse(input)
+            }
+        }
+    }
+    fn drop_and_then<NewOutput, P> (&self, parser: P) -> impl Parser<'a, NewOutput>
+    where
+        P: Parser<'a, NewOutput>
+    {
+        move |input| {
+            let (_parsed, remaining) = self.parse(input)?;
+            parser.parse(remaining)
+        }
+    }
+    fn and_then_drop<NewOutput, P> (&self, parser: P) -> impl Parser<'a, Output>
+    where
+        P: Parser<'a, NewOutput>
+    {
+        move |input: &'a str| -> Option<(Output, &'a str)> {
+            let (parsed1, remaining1) = self.parse(input)?;
+            let (_parsed2, remaining2) = parser.parse(remaining1)?;
+            Option::Some((parsed1, remaining2))
+        }
+    }
+    fn pair<SecondOutput, P> (&self, parser: P) -> impl Parser<'a, (Output, SecondOutput)>
+    where
+        P: Parser<'a, SecondOutput>
+    {
+        move |input| {
+            let (first, remaining1) = self.parse(input)?;
+            let (second, remaining2) = parser.parse(remaining1)?;
+            Option::Some(((first,second), remaining2))
+        }
+    }
+    fn map<NewOutput, F> (&self, mapping_function: F) -> impl Parser<'a, NewOutput>
+    where
+        F: Fn(Output) -> NewOutput
+    {
+        move |input| {
+            let (parsed, remaining) = self.parse(input)?;
+            Option::Some((mapping_function(parsed), remaining))
+        }
+    }
+}
+impl<'a, F, Output> Parser<'a, Output> for F
+where
+    F: Fn(&'a str) -> ParseResult<'a, Output>
+{
+    fn parse(&self, input: &'a str) -> ParseResult<'a, Output> {
+        self(input)
+    }
 }
 
-impl Parser {
-    fn new() -> Self {
-        let variable_regex = Regex::new(r"\$([a-zA-Z0-9_]+|\$|!)").unwrap();
-        Self { variable_regex }
-    }
-
-    fn tokenize(&self, input: &str) -> Vec<Token> {
-        let mut single_quotes = false;
-        let mut double_quotes = false;
-        let mut chars = input.chars().peekable();
-        let mut tokens: Vec<Token> = Vec::new();
-        let mut current = String::new();
-
-        while let Some(current_char) = chars.next() {
-            // remove preceding whitespace
-            if !single_quotes && !double_quotes && current.trim().is_empty() {
-                current.clear();
-            }
-
-            match current_char {
-                _ if current_char.is_whitespace() && !single_quotes && !double_quotes => {
-                    if !current.trim().is_empty() {
-                        tokens.push(Token::Word(current.clone(), Quoting::Unquoted));
-                        current.clear();
-                    }
-                    // only push if last token is not whitespace
-                    match tokens.last() {
-                        Some(Token::Whitespace) => {}
-                        _ => {
-                            tokens.push(Token::Whitespace);
-                            current.clear();
-                        }
-                    }
-                }
-                '\'' if !double_quotes => {
-                    if !current.is_empty() {
-                        let quoting = if single_quotes {
-                            Quoting::SingleQuoted
-                        } else {
-                            Quoting::Unquoted
-                        };
-                        tokens.push(Token::Word(current.clone(), quoting));
-                        current.clear();
-                    }
-                    single_quotes = !single_quotes;
-                }
-                '"' if !single_quotes => {
-                    if !current.is_empty() {
-                        let quoting = if double_quotes {
-                            Quoting::DoubleQuoted
-                        } else {
-                            Quoting::Unquoted
-                        };
-                        tokens.push(Token::Word(current.clone(), quoting));
-                        current.clear();
-                    }
-                    double_quotes = !double_quotes;
-                }
-                '&' if !single_quotes && !double_quotes => {
-                    if !current.trim().is_empty() {
-                        tokens.push(Token::Word(current.clone(), Quoting::Unquoted));
-                        current.clear();
-                    }
-                    if let Some(&ch) = chars.peek() {
-                        if ch == '&' {
-                            chars.next();
-                            tokens.push(Token::Operator(Operator::And));
-                        } else {
-                            tokens.push(Token::Operator(Operator::Andpercent));
-                        }
-                    } else {
-                        tokens.push(Token::Operator(Operator::Andpercent));
-                    }
-                    current.clear();
-                }
-                '|' if !single_quotes && !double_quotes => {
-                    if !current.trim().is_empty() {
-                        tokens.push(Token::Word(current.clone(), Quoting::Unquoted));
-                        current.clear();
-                    }
-                    if let Some(&ch) = chars.peek() {
-                        if ch == '|' {
-                            chars.next();
-                            tokens.push(Token::Operator(Operator::Or));
-                        } else {
-                            tokens.push(Token::Operator(Operator::Pipe));
-                        }
-                    } else {
-                        tokens.push(Token::Operator(Operator::Pipe));
-                    }
-                    current.clear();
-                }
-                ';' if !single_quotes && !double_quotes => {
-                    if !current.trim().is_empty() {
-                        tokens.push(Token::Word(current.clone(), Quoting::Unquoted));
-                        current.clear();
-                    }
-                    tokens.push(Token::Operator(Operator::Semicolon));
-                    current.clear();
-                }
-                '\\' => {
-                    if let Some(&ch) = chars.peek() {
-                        chars.next();
-                        match ch {
-                            'n' => current.push('\n'),
-                            't' => current.push('\t'),
-                            'r' => current.push('\r'),
-                            '0' => current.push('\0'),
-                            ch => current.push(ch),
-                        };
-                    }
-                }
-                _ => current.push(current_char),
-            }
-        }
-
-        // for now if a quote is opened and not closed the whole content is just discarded
-        if !current.trim().is_empty() && !single_quotes && !double_quotes {
-            tokens.push(Token::Word(current, Quoting::Unquoted));
-        }
-
-        tokens
-    }
-
-    fn parse(&self, tokens: Vec<Token>) -> Option<Command> {
-        if tokens.is_empty() {
-            None
+fn string_parser<'a>(expected: &'static str) -> impl Parser<'a, &'static str> {
+    move |input: &'a str| -> Option<(&'static str, &'a str)> {
+        if let Option::Some(suffix) = input.strip_prefix(expected) {
+            Option::Some((expected, suffix))
         } else {
-            let args: Vec<String> = tokens
-                .into_iter()
-                .filter_map(|token| match token {
-                    Token::Word(word, Quoting::SingleQuoted) => Some(word),
-                    Token::Word(word, _) => Some(
-                        self.variable_regex
-                            .replace_all(word.as_str(), |caps: &regex::Captures| {
-                                let k = &caps[1];
-                                env::var(k).unwrap_or_default()
-                            })
-                            .into_owned(),
-                    ),
-                    _ => None,
-                })
-                .collect();
-
-            match args[0].as_str() {
-                "exit" => Some(Command::Builtin(BuiltinCommand::Exit)),
-                "cd" => Some(Command::Builtin(BuiltinCommand::Cd(args))),
-                command => {
-                    let external_command = ExternalCommand::new(command.to_string(), args);
-                    Some(Command::External(external_command))
-                }
-            }
+            Option::None
         }
-    }
+    }     
+}
+fn never_parser<'a, Output>() -> impl Parser<'a, Output> {
+    |_inpupt| Option::None
+}
+
+fn test_parser() {
+    let input: &str = "Hallo Welt";
+    let parser = string_parser("Hallo");
+    let space_char = string_parser(" ");
+    let tab_char = string_parser("\t");
+    let newline_char = string_parser("\n");
+    let space_ = space_char.or(tab_char);
+    let space = space_.or(newline_char);
+    let whitspaces = space.many();
+    print!("Parsed: {}", whitspaces.parse(parser.parse(input).unwrap().1).unwrap().1)
 }
 
 struct Shell {
@@ -235,7 +179,6 @@ impl Shell {
     }
 
     fn run(&mut self) -> nix::Result<()> {
-        let parser = Parser::new();
         loop {
             print!("\n$ ");
             self.stdout_handle.flush().unwrap();
@@ -247,12 +190,63 @@ impl Shell {
                 println!("\nexit");
                 exit(0);
             }
-
-            let tokens = parser.tokenize(input.as_str());
-
-            if let Some(command) = parser.parse(tokens) {
+            let alpha_parser = {
+                let a_parser = string_parser("a");
+                let ab_parser = a_parser.or(string_parser("b"));
+                let abc_parser = ab_parser.or(string_parser("c"));
+                let abcd_parser = abc_parser.or(string_parser("d"));
+                let abcde_parser = abcd_parser.or(string_parser("e"));
+                let abcdef_parser = abcde_parser.or(string_parser("f"));
+                let abcdefg_parser = abcdef_parser.or(string_parser("g"));
+                let abcdefgh_parser = abcdefg_parser.or(string_parser("h"));
+                let abcdefghi_parser = abcdefgh_parser.or(string_parser("i"));
+                let abcdefghij_parser = abcdefghi_parser.or(string_parser("j"));
+                let abcdefghijk_parser = abcdefghij_parser.or(string_parser("k"));
+                let abcdefghijkl_parser = abcdefghijk_parser.or(string_parser("l"));
+                let abcdefghijklm_parser = abcdefghijkl_parser.or(string_parser("m"));
+                let abcdefghijklmn_parser = abcdefghijklm_parser.or(string_parser("n"));
+                let abcdefghijklmno_parser = abcdefghijklmn_parser.or(string_parser("o"));
+                let abcdefghijklmnop_parser = abcdefghijklmno_parser.or(string_parser("p"));
+                let abcdefghijklmnopq_parser = abcdefghijklmnop_parser.or(string_parser("q"));
+                let abcdefghijklmnopqr_parser = abcdefghijklmnopq_parser.or(string_parser("r"));
+                let abcdefghijklmnopqrs_parser = abcdefghijklmnopqr_parser.or(string_parser("s"));
+                let abcdefghijklmnopqrst_parser = abcdefghijklmnopqrs_parser.or(string_parser("t"));
+                let abcdefghijklmnopqrstu_parser = abcdefghijklmnopqrst_parser.or(string_parser("u"));
+                let abcdefghijklmnopqrstuv_parser = abcdefghijklmnopqrstu_parser.or(string_parser("v"));
+                let abcdefghijklmnopqrstuvw_parser = abcdefghijklmnopqrstuv_parser.or(string_parser("w"));
+                let abcdefghijklmnopqrstuvwx_parser = abcdefghijklmnopqrstuvw_parser.or(string_parser("x"));
+                let abcdefghijklmnopqrstuvwxy_parser = abcdefghijklmnopqrstuvwx_parser.or(string_parser("y"));
+                let abcdefghijklmnopqrstuvwxyz_parser = abcdefghijklmnopqrstuvwxy_parser.or(string_parser("z"));               
+                abcdefghijklmnopqrstuvwxyz_parser
+            }
+            let space_char = string_parser(" ");
+            let tab_char = string_parser("\t");
+            let newline_char = string_parser("\n");
+            let space_ = space_char.or(tab_char);
+            let space = space_.or(newline_char);
+            let whitspaces = space.many();
+            let word_parser = whitspaces.drop_and_then(alpha_parser.many()); 
+            let external_command_parser = word_parser.pair(word_parser.many()).and_then_drop(whitspaces);
+            let cd_parser = whitspaces
+                .drop_and_then(string_parser("cd"))
+                .pair(word_parser.many())
+                .map(|tup: (&'static str, Vec<&str>)| -> Command {
+                    Command::Builtin(
+                        BuiltinCommand::Cd(
+                            vec![]
+//                            tup.1.iter().map(|arg| arg.to_string()).collect()
+                        )
+                    )
+                });
+            let exit_parser = whitspaces.drop_and_then(string_parser("exit"));
+            if let Option::Some((command, args)) = command_parser.parse(&input) {
                 self.execute(command)?;
             }
+//            let tokens = parser.tokenize(input.as_str());
+//
+//            if let Some(command) = parser.parse(tokens) {
+//                self.execute(command)?;
+//            }
         }
     }
 
