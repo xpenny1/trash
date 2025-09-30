@@ -4,7 +4,9 @@ use nix::unistd::{
     ForkResult, Pid, chdir, execvp, fork, getcwd, getpid, setpgid, tcsetpgrp, write,
 };
 use regex::Regex;
-use std::env;
+use std::marker::PhantomData;
+use std::rc::Rc;
+use std::{env, ops};
 use std::ffi::CString;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -383,9 +385,115 @@ impl ExternalCommand {
     }
 }
 
+
+struct StringParser {
+    string: String
+}
+struct OrParser<P1,P2> {
+    parser1: P1,
+    parser2: P2
+}
+struct NeverParser {}
+struct MapParser<P1,F,OldOutput>
+{
+    parser: P1,
+    function: F,
+    old_output: PhantomData<OldOutput>
+}
+struct ManyParser<P> {
+    parser: P
+}
+
+trait ParserT<Output> {
+    fn parse(&self, input: String) -> Option<(Output, String)>;
+    fn or<P>(&self, parser: P) -> OrParser<&Self, P>
+    where
+        P: ParserT<Output>
+    {
+        OrParser {
+            parser1: self,
+            parser2: parser
+        }   
+    }
+    fn map<F, NewOutput>(&self, f: F) -> MapParser<&Self, F, Output>
+    where
+        F: Fn(Output) -> NewOutput
+    {
+        MapParser { parser: self, function: f, old_output: PhantomData }
+    }
+}
+
+impl<Output, P> ParserT<Vec<Output>> for ManyParser<P>
+where
+    P: ParserT<Output>
+{
+    fn parse(&self, input: String) -> Option<(Vec<Output>, String)> {
+        let mut remaining_input: String = input.clone();
+        let mut result: Vec<Output> = Vec::new();
+        while let Some((current_result,current_remaining_input)) = self.parser.parse(input.clone()) {
+            result.push(current_result);
+            remaining_input = current_remaining_input;
+        }
+        Some((result,remaining_input))
+    }
+}
+
+impl<Output, P1, NewOutput, F> ParserT<NewOutput> for MapParser<P1, F, Output>
+where
+    P1: ParserT<Output>,
+    F: Fn(Output) -> NewOutput
+{
+    fn parse(&self, input: String) -> Option<(NewOutput, String)> {
+        self.parser.parse(input).map(
+            |t| ((self.function)(t.0), t.1)
+        )
+    }
+}
+
+impl ParserT<String> for StringParser {
+    fn parse(&self, input: String) -> Option<(String, String)> {
+        if let Some(suffix) = input.strip_prefix(self.string.as_str()) {
+            Some((input.clone(),suffix.to_owned()))
+        } else {
+            None
+        }
+    }
+}
+
+impl<Output, P1, P2> ParserT<Output> for OrParser<P1, P2>
+where
+    P1: ParserT<Output>,
+    P2: ParserT<Output>
+{
+    fn parse(&self, input: String) -> Option<(Output, String)> {
+        self.parser1.parse(input.clone()).or(self.parser2.parse(input))
+    }
+}
+
+impl<Output> ParserT<Output> for NeverParser {
+    fn parse(&self, input: String) -> Option<(Output, String)> {
+        None
+    }
+}
+
+//struct ParserS<Output> {
+//    parser: Rc<dyn ParserT<Output>>
+//}
+//impl<Output> ParserT<Output> for Rc<dyn ParserT<Output>> {
+//    fn parse(&self, input: String) -> Option<(Output, String)> {
+//        (**self).parse(input)
+//    }
+//}
+
+
+
 fn main() {
-    let mut shell = Shell::new().expect("Failed to spawn shell");
-    shell.run().expect("Failed to run shell");
+//    let mut shell = Shell::new().expect("Failed to spawn shell");
+//    shell.run().expect("Failed to run shell");
+    let test: String = " cd     /home".to_owned();
+    let whitespace_parser =
+        StringParser { string: " ".to_owned() }
+        .or(StringParser { string: "    ".to_owned() })
 }
 
 #[cfg(test)]
