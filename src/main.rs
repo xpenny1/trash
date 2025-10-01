@@ -403,15 +403,27 @@ struct MapParser<P1,F,OldOutput>
 struct ManyParser<P> {
     parser: P
 }
+struct DiscardAndThenKeepParser<P1,P2,DiscardedOutput> {
+    parser1: P1,
+    parser2: P2,
+    discarded_output: PhantomData<DiscardedOutput>
+    
+}
+struct KeepAndThenDiscardParser<P1,P2,DiscardedOutput> {
+    parser1: P1,
+    parser2: P2,
+    discarded_output: PhantomData<DiscardedOutput>
+    
+}
 
 trait ParserT<Output> {
     fn parse(&self, input: String) -> Option<(Output, String)>;
-    fn or<P>(&self, parser: P) -> OrParser<&Self, P>
+    fn or<P>(&self, parser: P) -> OrParser<Box<&Self>, P>
     where
         P: ParserT<Output>
     {
         OrParser {
-            parser1: self,
+            parser1: Box::new(self),
             parser2: parser
         }   
     }
@@ -420,6 +432,58 @@ trait ParserT<Output> {
         F: Fn(Output) -> NewOutput
     {
         MapParser { parser: self, function: f, old_output: PhantomData }
+    }
+    fn keep_and_then_discard<DiscardedOutput, P>(&self, parser: P) -> KeepAndThenDiscardParser<&Self, P, DiscardedOutput>
+    where
+        P: ParserT<DiscardedOutput>
+    {
+        KeepAndThenDiscardParser { parser1: self, parser2: parser, discarded_output: PhantomData }
+    }
+    fn discard_and_then_keep<NewOutput, P>(&self, parser: P) -> DiscardAndThenKeepParser<&Self, P, Output>
+    where
+        P: ParserT<NewOutput>
+    {
+        DiscardAndThenKeepParser { parser1: self, parser2: parser, discarded_output: PhantomData }
+    }
+}
+
+impl<Output,P> ParserT<Output> for &P
+where
+    P: ParserT<Output>
+{
+    fn parse(&self, input: String) -> Option<(Output, String)> {
+        (**self).parse(input)
+    }
+}
+impl<Output,P> ParserT<Output> for Box<P>
+where
+    P: ParserT<Output>
+{
+    fn parse(&self, input: String) -> Option<(Output, String)> {
+        (**self).parse(input)
+    }
+}
+
+impl<DiscardedOutput,Output,P1,P2> ParserT<Output> for KeepAndThenDiscardParser<P1,P2,DiscardedOutput>
+where
+    P1: ParserT<Output>,
+    P2: ParserT<DiscardedOutput>
+{
+    fn parse(&self, input: String) -> Option<(Output, String)> {
+        let (result, _remaining) = self.parser1.parse(input)?;
+        let (_discarded_result, remaining) = self.parser2.parse(_remaining)?;
+        Some((result, remaining))
+    }
+}
+
+impl<DiscardedOutput,Output,P1,P2> ParserT<Output> for DiscardAndThenKeepParser<P1,P2,DiscardedOutput>
+where
+    P1: ParserT<DiscardedOutput>,
+    P2: ParserT<Output>
+{
+    fn parse(&self, input: String) -> Option<(Output, String)> {
+        let (_result, remaining) = self.parser1.parse(input)?;
+        self.parser2.parse(remaining)
     }
 }
 
@@ -491,9 +555,13 @@ fn main() {
 //    let mut shell = Shell::new().expect("Failed to spawn shell");
 //    shell.run().expect("Failed to run shell");
     let test: String = " cd     /home".to_owned();
-    let whitespace_parser =
+    let whitespace_parser: OrParser<Box<&StringParser>, StringParser>  =
         StringParser { string: " ".to_owned() }
-        .or(StringParser { string: "    ".to_owned() })
+        .or(StringParser { string: "    ".to_owned() });
+    let cd_parser =
+        whitespace_parser
+        .discard_and_then_keep(StringParser { string: "cd".to_owned() } )
+
 }
 
 #[cfg(test)]
